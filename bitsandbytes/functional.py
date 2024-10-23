@@ -644,7 +644,7 @@ def estimate_quantiles(
 class QuantState:
     """container for quantization state components to work with Params4bit and similar classes"""
 
-    valid_quant_types = ("fp4", "nf4")
+    valid_quant_types = ("fp4", "nf4", "q4_0")
     valid_qs_type_keys = [f"bitsandbytes__{x}" for x in valid_quant_types]
     valid_qs_keys = [
         "absmax",
@@ -1452,6 +1452,97 @@ def dequantize_4bit(
     else:
         return out
 
+def quantize_q4_0(
+    A: torch.Tensor,
+    blocksize: int = 32,
+) -> Tuple[torch.Tensor, QuantState]:
+    
+    # Store the original shape before padding
+    original_shape = A.shape
+    A = A.contiguous().view(-1)
+    n = A.numel()
+    n_blocks = (n + blocksize - 1) // blocksize  # Ceiling division
+
+    # Pad A if necessary
+    pad_size = n_blocks * blocksize - n
+    if pad_size > 0:
+        A = torch.cat([A, torch.zeros(pad_size, dtype=A.dtype)], dim=0)
+
+    A_blocks = A.view(n_blocks, blocksize)
+
+    # Compute max absolute value in each block
+    imax = torch.abs(A_blocks).argmax(dim=-1, keepdim=True)
+    max_vals = torch.gather(A_blocks, dim=-1, index=imax)
+
+    d = max_vals / -8
+    id = torch.where(d == 0, torch.zeros_like(d), 1 / d)
+
+    # Use float64 for intermediate calculations
+    A_blocks_float64 = A_blocks.double()
+    id_float64 = id.double()
+
+    # Compute qs = trunc((A_blocks * id) + 8.5)
+    qs = torch.trunc((A_blocks_float64 * id_float64) + 8.5).clamp(0, 15).byte()
+
+    # Pack qs into 4-bit values
+    qs = qs.view(n_blocks, 2, blocksize // 2)
+    qs_packed = qs[:, 0, :] | (qs[:, 1, :] << 4)
+
+    # Convert d to float16 and reinterpret as uint16
+    d_float16 = d.squeeze(-1).to(torch.float16)
+    d_uint16 = d_float16.view(torch.uint16)
+
+    # Concatenate d_uint16 and qs_packed
+    quantized_data = torch.cat([d_uint16.view(n_blocks, 1), qs_packed], dim=1).view(-1)
+
+    # Create quantization state using the original shape
+    quant_state = QuantState(
+        absmax=None,  # Not used here
+        shape=original_shape,  # Use original shape before padding
+        dtype=A.dtype,
+        blocksize=blocksize,
+        code=None,  # Not used
+        quant_type="q4_0",
+    )
+
+    return quantized_data, quant_state
+
+def dequantize_q4_0(
+    A_quant: torch.Tensor,
+    quant_state: QuantState,
+) -> torch.Tensor:
+    
+    blocksize = quant_state.blocksize
+    n = quant_state.shape.numel()
+    n_blocks = (n + blocksize - 1) // blocksize  # Ceiling division
+
+    # Compute sizes
+    per_block_size = 1 + (blocksize // 2)
+    total_size = per_block_size * n_blocks
+
+    assert A_quant.numel() == total_size, "Quantized data size mismatch."
+
+    quantized_data = A_quant.view(n_blocks, per_block_size)
+
+    # Split d_uint16 and qs_packed
+    d_uint16 = quantized_data[:, :1].contiguous().view(-1)
+    qs_packed = quantized_data[:, 1:]
+
+    # Convert d_uint16 back to float16 and then to float32
+    d = d_uint16.view(torch.float16).to(torch.float32).view(n_blocks, 1)
+
+    # Unpack qs_packed into 4-bit values
+    qs_packed = qs_packed.view(n_blocks, -1)
+    qs = qs_packed.unsqueeze(-1).expand(-1, -1, 2)
+    shift_tensor = torch.tensor([0, 4], dtype=torch.uint8, device=qs_packed.device)
+    qs = (qs >> shift_tensor) & 0x0F
+    qs = qs.view(n_blocks, -1).to(torch.int8) - 8
+
+    # Reconstruct the original values
+    A_reconstructed = (d * qs.to(torch.float32)).view(-1)[:n]
+    A_reconstructed = A_reconstructed.view(quant_state.shape)
+
+    return A_reconstructed
 
 def quantize(
     A: Tensor,
