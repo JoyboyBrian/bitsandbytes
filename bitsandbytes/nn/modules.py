@@ -294,13 +294,22 @@ class Params4bit(torch.nn.Parameter):
 
     def _quantize(self, device):
         w = self.data.contiguous().to(device)
-        w_4bit, quant_state = bnb.functional.quantize_4bit(
-            w,
-            blocksize=self.blocksize,
-            compress_statistics=self.compress_statistics,
-            quant_type=self.quant_type,
-            quant_storage=self.quant_storage,
-        )
+        # choose different quantization methods based on quantization type
+        if self.quant_type == "q4_0":
+            w_4bit, quant_state = bnb.functional.quantize_q4_0(
+                w,
+                blocksize=self.blocksize,
+                quant_storage=self.quant_storage,
+            )
+        else:
+            # original fp4/nf4 implementation
+            w_4bit, quant_state = bnb.functional.quantize_4bit(
+                w,
+                blocksize=self.blocksize,
+                compress_statistics=self.compress_statistics,
+                quant_type=self.quant_type,
+                quant_storage=self.quant_storage,
+            )
         self.data = w_4bit
         self.quant_state = quant_state
         if self.module is not None:
@@ -468,7 +477,6 @@ class Linear4bit(nn.Linear):
     def forward(self, x: torch.Tensor):
         fix_4bit_weight_quant_state_from_module(self)
 
-        # weights are cast automatically as Int8Params, but the bias has to be cast manually
         if self.bias is not None and self.bias.dtype != x.dtype:
             self.bias.data = self.bias.data.to(x.dtype)
 
@@ -481,10 +489,21 @@ class Linear4bit(nn.Linear):
             x = x.to(self.compute_dtype)
 
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
-        out = bnb.matmul_4bit(x, self.weight.t(), bias=bias, quant_state=self.weight.quant_state)
+        
+        if self.weight.quant_type == "q4_0":
+            # q4_0 implementation
+            dequantized_weight = bnb.functional.dequantize_q4_0(
+                self.weight.data, 
+                self.weight.quant_state
+            )
+            out = torch.matmul(x, dequantized_weight.t())
+            if bias is not None:
+                out = out + bias
+        else:
+            # original fp4/nf4 implementation
+            out = bnb.matmul_4bit(x, self.weight.t(), bias=bias, quant_state=self.weight.quant_state)
 
         out = out.to(inp_dtype)
-
         return out
 
 
@@ -1081,3 +1100,4 @@ class SwitchBackLinearBnb(nn.Linear):
             self.init_8bit_state()
 
         out = bnb.matmul_mixed(x.half(), self.weight.half(), bias=None, state=self.state) + self.bias
+

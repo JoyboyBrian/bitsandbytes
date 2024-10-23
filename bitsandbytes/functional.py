@@ -1451,98 +1451,99 @@ def dequantize_4bit(
         return out.t()
     else:
         return out
-
-def quantize_q4_0(
-    A: torch.Tensor,
-    blocksize: int = 32,
-) -> Tuple[torch.Tensor, QuantState]:
     
-    # Store the original shape before padding
-    original_shape = A.shape
-    A = A.contiguous().view(-1)
-    n = A.numel()
-    n_blocks = (n + blocksize - 1) // blocksize  # Ceiling division
 
-    # Pad A if necessary
-    pad_size = n_blocks * blocksize - n
-    if pad_size > 0:
-        A = torch.cat([A, torch.zeros(pad_size, dtype=A.dtype)], dim=0)
+def quantize_q4_0(weights):
+    """
+    Performs Q4_0 quantization on the input Tensor. Both input and output are Tensor types.
 
-    A_blocks = A.view(n_blocks, blocksize)
+    Args:
+        weights (torch.Tensor): Input weight tensor.
 
-    # Compute max absolute value in each block
-    imax = torch.abs(A_blocks).argmax(dim=-1, keepdim=True)
-    max_vals = torch.gather(A_blocks, dim=-1, index=imax)
+    Returns:
+        torch.Tensor: Quantized tensor.
+    """
+    BLOCK_SIZE = 32  # Set according to actual needs
 
-    d = max_vals / -8
-    id = torch.where(d == 0, torch.zeros_like(d), 1 / d)
+    # Convert Tensor to NumPy array, ensure float32 type
+    weights_np = weights.detach().cpu().numpy().astype(np.float32)
 
-    # Use float64 for intermediate calculations
-    A_blocks_float64 = A_blocks.double()
-    id_float64 = id.double()
+    n_elements = weights_np.size
+    n_blocks = n_elements // BLOCK_SIZE
+    blocks = weights_np[:n_blocks * BLOCK_SIZE].reshape(n_blocks, BLOCK_SIZE)
 
-    # Compute qs = trunc((A_blocks * id) + 8.5)
-    qs = torch.trunc((A_blocks_float64 * id_float64) + 8.5).clamp(0, 15).byte()
+    # Find the maximum absolute value for each block
+    imax = np.abs(blocks).argmax(axis=-1, keepdims=True)
+    max_vals = np.take_along_axis(blocks, imax, axis=-1)
 
-    # Pack qs into 4-bit values
-    qs = qs.view(n_blocks, 2, blocksize // 2)
+    # Calculate scaling factor d
+    d = max_vals / -8.0  # Shape: (n_blocks, 1)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        id = np.where(d == 0, 0.0, 1.0 / d)  # Shape: (n_blocks, 1)
+
+    # Perform quantization
+    blocks_64 = blocks.astype(np.float64)
+    id_64 = id.astype(np.float64)
+    qs = np.trunc(blocks_64 * id_64 + np.float64(8.5), dtype=np.float32).astype(np.uint8)
+    qs = np.clip(qs, 0, 15)  # Ensure within [0, 15] range
+
+    # Pack quantized values
+    qs = qs.reshape(n_blocks, 2, BLOCK_SIZE // 2)
     qs_packed = qs[:, 0, :] | (qs[:, 1, :] << 4)
 
-    # Convert d to float16 and reinterpret as uint16
-    d_float16 = d.squeeze(-1).to(torch.float16)
-    d_uint16 = d_float16.view(torch.uint16)
+    # Convert scaling factor d to uint8 representation
+    d_uint8 = d.astype(np.float16).view(np.uint8)
 
-    # Concatenate d_uint16 and qs_packed
-    quantized_data = torch.cat([d_uint16.view(n_blocks, 1), qs_packed], dim=1).view(-1)
+    # Combine scaling factor and quantized values
+    quantized_blocks = np.concatenate([d_uint8.reshape(n_blocks, -1), qs_packed], axis=1)
 
-    # Create quantization state using the original shape
-    quant_state = QuantState(
-        absmax=None,  # Not used here
-        shape=original_shape,  # Use original shape before padding
-        dtype=A.dtype,
-        blocksize=blocksize,
-        code=None,  # Not used
-        quant_type="q4_0",
-    )
+    # Handle remaining elements (if any)
+    remainder = weights_np[n_blocks * BLOCK_SIZE:]
+    # Process remainder as needed (not handled here)
 
-    return quantized_data, quant_state
+    # Convert result back to Tensor
+    quantized_tensor = torch.from_numpy(quantized_blocks)
 
-def dequantize_q4_0(
-    A_quant: torch.Tensor,
-    quant_state: QuantState,
-) -> torch.Tensor:
-    
-    blocksize = quant_state.blocksize
-    n = quant_state.shape.numel()
-    n_blocks = (n + blocksize - 1) // blocksize  # Ceiling division
+    return quantized_tensor
 
-    # Compute sizes
-    per_block_size = 1 + (blocksize // 2)
-    total_size = per_block_size * n_blocks
+def dequantize_q4_0(quantized_tensor):
+    """
+    Performs Q4_0 dequantization on the quantized Tensor. Both input and output are Tensor types.
 
-    assert A_quant.numel() == total_size, "Quantized data size mismatch."
+    Args:
+        quantized_tensor (torch.Tensor): Quantized tensor.
 
-    quantized_data = A_quant.view(n_blocks, per_block_size)
+    Returns:
+        torch.Tensor: Dequantized tensor.
+    """
+    # Convert Tensor to NumPy array
+    quantized_blocks = quantized_tensor.detach().cpu().numpy()
 
-    # Split d_uint16 and qs_packed
-    d_uint16 = quantized_data[:, :1].contiguous().view(-1)
-    qs_packed = quantized_data[:, 1:]
+    n_blocks = quantized_blocks.shape[0]
 
-    # Convert d_uint16 back to float16 and then to float32
-    d = d_uint16.view(torch.float16).to(torch.float32).view(n_blocks, 1)
+    # Split d and qs according to original code
+    d_uint8, qs_packed = np.hsplit(quantized_blocks, [2])
 
-    # Unpack qs_packed into 4-bit values
-    qs_packed = qs_packed.view(n_blocks, -1)
-    qs = qs_packed.unsqueeze(-1).expand(-1, -1, 2)
-    shift_tensor = torch.tensor([0, 4], dtype=torch.uint8, device=qs_packed.device)
-    qs = (qs >> shift_tensor) & 0x0F
-    qs = qs.view(n_blocks, -1).to(torch.int8) - 8
+    # Restore d and convert to float32
+    d = d_uint8.view(np.float16).astype(np.float32)  # Shape: (n_blocks, 1)
 
-    # Reconstruct the original values
-    A_reconstructed = (d * qs.to(torch.float32)).view(-1)[:n]
-    A_reconstructed = A_reconstructed.view(quant_state.shape)
+    BLOCK_SIZE = 32  # Same as in quantization
 
-    return A_reconstructed
+    # Decode qs
+    qs = qs_packed.reshape((n_blocks, -1, 1, BLOCK_SIZE // 2))
+    shifts = np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+    qs = qs >> shifts
+    qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
+
+    # Calculate dequantized result
+    dequantized_blocks = (d * qs.astype(np.float32)).reshape(-1)
+
+    # Convert result back to Tensor
+    dequantized_tensor = torch.from_numpy(dequantized_blocks)
+
+    return dequantized_tensor
+
 
 def quantize(
     A: Tensor,
