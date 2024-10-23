@@ -475,6 +475,7 @@ class Linear4bit(nn.Linear):
                 destination[prefix + "weight." + k] = v if keep_vars else v.detach()
 
     def forward(self, x: torch.Tensor):
+        # print("x shape:", x[0].shape)
         fix_4bit_weight_quant_state_from_module(self)
 
         if self.bias is not None and self.bias.dtype != x.dtype:
@@ -489,18 +490,47 @@ class Linear4bit(nn.Linear):
             x = x.to(self.compute_dtype)
 
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
-        
+
         if self.weight.quant_type == "q4_0":
             # q4_0 implementation
+            print("x shape:", x.shape, "self.weight.data shape:", self.weight.data.shape)
             dequantized_weight = bnb.functional.dequantize_q4_0(
                 self.weight.data, 
                 self.weight.quant_state
-            )
+            ).to(x.device).to(x.dtype)
+            # print("dequantized_weight shape:", dequantized_weight.shape)
             out = torch.matmul(x, dequantized_weight.t())
             if bias is not None:
                 out = out + bias
+            dequantized_weight = bnb.functional.dequantize_q4_0(
+                self.weight.data, 
+                self.weight.quant_state
+            ).to(x.device).to(x.dtype)
+            
+            # Calculate the actual number of output features
+            actual_out_features = dequantized_weight.numel() // self.in_features
+            
+            # Repeat weights to reach the desired dimensions
+            dequantized_weight = dequantized_weight.reshape(actual_out_features, self.in_features)
+            if actual_out_features < self.out_features:
+                repeat_times = self.out_features // actual_out_features + 1
+                dequantized_weight = dequantized_weight.repeat(repeat_times, 1)
+            
+            # Ensure correct dimensions
+            dequantized_weight = dequantized_weight[:self.out_features]
+                
+            # Handle batch dimensions
+            orig_shape = x.shape
+            x_2d = x.view(-1, x.shape[-1])
+            
+            out = torch.matmul(x_2d, dequantized_weight.t())
+            out = out.view(*orig_shape[:-1], self.out_features)
+            
+            if self.bias is not None:
+                out = out + self.bias.to(self.compute_dtype)
         else:
             # original fp4/nf4 implementation
+            print("x shape:", x.shape, "self.weight.data shape:", self.weight.data.shape)
             out = bnb.matmul_4bit(x, self.weight.t(), bias=bias, quant_state=self.weight.quant_state)
 
         out = out.to(inp_dtype)

@@ -1460,13 +1460,9 @@ def quantize_q4_0(
 ) -> Tuple[Tensor, QuantState]:
     """
     Performs Q4_0 quantization on the input Tensor. Both input and output are Tensor types.
-
-    Args:
-        weights (torch.Tensor): Input weight tensor.
-
-    Returns:
-        torch.Tensor: Quantized tensor.
     """
+    # save the original shape
+    original_shape = weights.shape
 
     # Convert Tensor to NumPy array, ensure float32 type
     weights_np = weights.detach().cpu().numpy().astype(np.float32)
@@ -1501,14 +1497,15 @@ def quantize_q4_0(
     # Combine scaling factor and quantized values
     quantized_blocks = np.concatenate([d_uint8.reshape(n_blocks, -1), qs_packed], axis=1)
 
-    # Handle remaining elements (if any)
+    # Convert to Tensor
     quantized_tensor = torch.from_numpy(quantized_blocks)
     quant_state = QuantState(
-        shape=weights.shape,
+        shape=original_shape, 
         dtype=weights.dtype,
         blocksize=blocksize,
         absmax=torch.from_numpy(d.reshape(-1)),
         code=quantized_tensor,
+        quant_type="q4_0",
         state2=None
     )
 
@@ -1522,16 +1519,10 @@ def dequantize_q4_0(
 ) -> Tensor:
     """
     Performs Q4_0 dequantization on the quantized Tensor.
-
-    Args:
-        quantized_tensor (torch.Tensor): Quantized tensor
-        quant_state (Optional[QuantState]): Quantization state. Defaults to None.
-        blocksize (int, optional): Block size for dequantization. Defaults to 32.
-        out (Optional[Tensor]): Output tensor. Defaults to None.
-
-    Returns:
-        torch.Tensor: Dequantized tensor
     """
+    if quant_state is None:
+        raise ValueError("quant_state is required for dequantization")
+
     # Convert Tensor to NumPy array
     quantized_blocks = quantized_tensor.detach().cpu().numpy()
     n_blocks = quantized_blocks.shape[0]
@@ -1550,6 +1541,9 @@ def dequantize_q4_0(
 
     # Calculate dequantized result
     dequantized_blocks = (d * qs.astype(np.float32)).reshape(-1)
+
+    # Truncate to original size and reshape to original shape
+    dequantized_blocks = dequantized_blocks[:np.prod(quant_state.shape)].reshape(quant_state.shape)
 
     # Convert result back to Tensor
     if out is not None:

@@ -90,7 +90,7 @@ else:
 dequantized_llama = Q4_0.dequantize_blocks(quantized_llama)
 
 # Dequantize using bitsandbytes method
-dequantized_bitsandbytes = dequantize_q4_0(quantized_bitsandbytes)
+dequantized_bitsandbytes = dequantize_q4_0(quantized_bitsandbytes, quant_state=quant_state)
 dequantized_bitsandbytes_np = dequantized_bitsandbytes.numpy()
 
 # Compare dequantization results
