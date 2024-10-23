@@ -72,7 +72,7 @@ quantized_llama = Q4_0.quantize_blocks(blocks_np)
 # Quantize using bitsandbytes method
 # Need to pad A_torch in the same way
 A_torch_padded = torch.from_numpy(A_np_padded)
-quantized_bitsandbytes = quantize_q4_0(A_torch_padded)
+quantized_bitsandbytes, quant_state = quantize_q4_0(A_torch_padded)
 
 # Compare quantization results
 quantized_bitsandbytes_np = quantized_bitsandbytes.numpy()

@@ -1453,7 +1453,11 @@ def dequantize_4bit(
         return out
     
 
-def quantize_q4_0(weights):
+def quantize_q4_0(
+    weights: Tensor,
+    blocksize: int = 32,
+    quant_storage: torch.dtype = torch.uint8,
+) -> Tuple[Tensor, QuantState]:
     """
     Performs Q4_0 quantization on the input Tensor. Both input and output are Tensor types.
 
@@ -1463,14 +1467,13 @@ def quantize_q4_0(weights):
     Returns:
         torch.Tensor: Quantized tensor.
     """
-    BLOCK_SIZE = 32  # Set according to actual needs
 
     # Convert Tensor to NumPy array, ensure float32 type
     weights_np = weights.detach().cpu().numpy().astype(np.float32)
 
     n_elements = weights_np.size
-    n_blocks = n_elements // BLOCK_SIZE
-    blocks = weights_np[:n_blocks * BLOCK_SIZE].reshape(n_blocks, BLOCK_SIZE)
+    n_blocks = n_elements // blocksize
+    blocks = weights_np[:n_blocks * blocksize].reshape(n_blocks, blocksize)
 
     # Find the maximum absolute value for each block
     imax = np.abs(blocks).argmax(axis=-1, keepdims=True)
@@ -1489,7 +1492,7 @@ def quantize_q4_0(weights):
     qs = np.clip(qs, 0, 15)  # Ensure within [0, 15] range
 
     # Pack quantized values
-    qs = qs.reshape(n_blocks, 2, BLOCK_SIZE // 2)
+    qs = qs.reshape(n_blocks, 2, blocksize // 2)
     qs_packed = qs[:, 0, :] | (qs[:, 1, :] << 4)
 
     # Convert scaling factor d to uint8 representation
@@ -1499,27 +1502,38 @@ def quantize_q4_0(weights):
     quantized_blocks = np.concatenate([d_uint8.reshape(n_blocks, -1), qs_packed], axis=1)
 
     # Handle remaining elements (if any)
-    remainder = weights_np[n_blocks * BLOCK_SIZE:]
-    # Process remainder as needed (not handled here)
-
-    # Convert result back to Tensor
     quantized_tensor = torch.from_numpy(quantized_blocks)
+    quant_state = QuantState(
+        shape=weights.shape,
+        dtype=weights.dtype,
+        blocksize=blocksize,
+        absmax=torch.from_numpy(d.reshape(-1)),
+        code=quantized_tensor,
+        state2=None
+    )
 
-    return quantized_tensor
+    return quantized_tensor, quant_state
 
-def dequantize_q4_0(quantized_tensor):
+def dequantize_q4_0(
+    quantized_tensor: Tensor,
+    quant_state: Optional[QuantState] = None,
+    blocksize: int = 32,
+    out: Optional[Tensor] = None
+) -> Tensor:
     """
-    Performs Q4_0 dequantization on the quantized Tensor. Both input and output are Tensor types.
+    Performs Q4_0 dequantization on the quantized Tensor.
 
     Args:
-        quantized_tensor (torch.Tensor): Quantized tensor.
+        quantized_tensor (torch.Tensor): Quantized tensor
+        quant_state (Optional[QuantState]): Quantization state. Defaults to None.
+        blocksize (int, optional): Block size for dequantization. Defaults to 32.
+        out (Optional[Tensor]): Output tensor. Defaults to None.
 
     Returns:
-        torch.Tensor: Dequantized tensor.
+        torch.Tensor: Dequantized tensor
     """
     # Convert Tensor to NumPy array
     quantized_blocks = quantized_tensor.detach().cpu().numpy()
-
     n_blocks = quantized_blocks.shape[0]
 
     # Split d and qs according to original code
@@ -1528,10 +1542,8 @@ def dequantize_q4_0(quantized_tensor):
     # Restore d and convert to float32
     d = d_uint8.view(np.float16).astype(np.float32)  # Shape: (n_blocks, 1)
 
-    BLOCK_SIZE = 32  # Same as in quantization
-
     # Decode qs
-    qs = qs_packed.reshape((n_blocks, -1, 1, BLOCK_SIZE // 2))
+    qs = qs_packed.reshape((n_blocks, -1, 1, blocksize // 2))
     shifts = np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
     qs = qs >> shifts
     qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
@@ -1540,9 +1552,11 @@ def dequantize_q4_0(quantized_tensor):
     dequantized_blocks = (d * qs.astype(np.float32)).reshape(-1)
 
     # Convert result back to Tensor
-    dequantized_tensor = torch.from_numpy(dequantized_blocks)
-
-    return dequantized_tensor
+    if out is not None:
+        out.copy_(torch.from_numpy(dequantized_blocks))
+        return out
+    else:
+        return torch.from_numpy(dequantized_blocks)
 
 
 def quantize(
